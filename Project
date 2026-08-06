@@ -1,0 +1,1351 @@
+
+    INCLUDE core_cm4_constants.s
+    INCLUDE stm32l476xx_constants.s    
+
+; Constants for the simulation
+STEPS_PER_REV       EQU     2048    ; Full steps per revolution for stepper motor
+STATION_STEPS       EQU     500     ; Steps between stations
+DOOR_OPEN_STEPS     EQU     1024     ; Steps to open/close door
+DWELL_TIME          EQU     300      ; Delay at station for passenger exit/entry
+
+; Button pins
+BUTTON_PIN          EQU     (1<<13) ; PC13 for blue button (emergency stop)
+RESET_PIN           EQU     (1<<0)  ; PA0 for reset button
+
+; Station definitions
+STATION_A           EQU     0       ; Terminal A
+STATION_B           EQU     1       ; Terminal B
+STATION_C           EQU     2       ; Terminal C
+
+; Operation modes
+MODE_AUTO           EQU     0       ; Automatic operation
+MODE_MANUAL         EQU     1       ; Manual override
+MODE_EMERGENCY      EQU     2       ; Emergency stop
+
+; Train directions
+DIR_FORWARD         EQU     0       ; Forward direction (A->B->C)
+DIR_BACKWARD        EQU     1       ; Backward direction (C->B->A)
+
+; Import external functions (if available in your project)
+    IMPORT  System_Clock_Init
+    IMPORT  UART2_Init
+    IMPORT  USART2_Write
+
+    AREA    main, CODE, READONLY
+    EXPORT __main
+    ENTRY
+
+__main PROC
+    ; Initialize system clock and UART
+    BL      System_Clock_Init
+    BL      UART2_Init
+    
+    ; Initialize GPIOs
+    BL      GPIO_Init
+
+    ; Initialize system state
+
+	LDR     R0, =current_station
+    MOV     R1, #STATION_A
+    STR     R1, [R0]              ; Starting at Station A
+    
+    LDR     R0, =current_mode
+    MOV     R1, #MODE_AUTO
+    STR     R1, [R0]              ; Starting in automatic mode
+    
+    LDR     R0, =train_direction
+    MOV     R1, #DIR_FORWARD
+    STR     R1, [R0]              ; Starting moving forward
+    
+    LDR     R0, =destination
+    MOV     R1, #STATION_A
+    STR     R1, [R0]              ; Initial destination is A
+    
+    LDR     R0, =door_state
+    MOV     R1, #0
+    STR     R1, [R0]              ; Door closed initially
+    
+    ; Initialize dwell counter
+    LDR     R0, =dwell_counter
+    MOV     R1, #0
+    STR     R1, [R0]
+
+    ; Display initial station
+    MOV     R0, #STATION_A
+    BL      update_display
+
+    ; Send startup message
+    LDR     R0, =StartMsg
+    LDR     R1, =StartMsgLen
+    BL      USART2_Write
+	
+
+    ; Main operation loop
+main_loop
+    ; Checking for emergency stop button (PC13)
+    LDR     R0, =GPIOC_BASE
+    LDR     R1, [R0, #GPIO_IDR]
+    TST     R1, #BUTTON_PIN
+    BEQ     emergency_stop_jump   ; If button pressed, jump to emergency stop
+    
+    ; Checking for reset button (PA0)
+    LDR     R0, =GPIOA_BASE
+    LDR     R1, [R0, #GPIO_IDR]
+    TST     R1, #RESET_PIN
+    BEQ     reset_train_jump      ; If button pressed, jump to reset train
+    
+    ; Scanning keypad for manual override
+    BL      scan_keypad
+    
+    ; After scanning keypad, check if mode was changed
+    LDR     R0, =current_mode
+    LDR     R1, [R0]
+    
+    CMP     R1, #MODE_EMERGENCY
+    BEQ     main_loop             ; If emergency, stay in loop until reset
+    
+    CMP     R1, #MODE_MANUAL
+    BEQ     manual_operation_jump ; Handle manual operation IMMEDIATELY
+    
+    ; Automatic operation
+    BL      auto_operation
+    
+    ; Delay for system stability
+    LDR     R0, =10000
+    BL      delay
+    
+    B       main_loop
+
+; Jump helpers for long branches
+emergency_stop_jump
+    B       emergency_stop
+    
+reset_train_jump
+    B       reset_train
+    
+manual_operation_jump
+    B       manual_operation
+
+    ; Adding literal pool after jumps
+    LTORG
+
+; GPIO Initialization
+GPIO_Init
+    PUSH    {LR}
+    
+    ; Enabling clocks for GPIOA, GPIOB, and GPIOC
+    LDR     R0, =RCC_BASE
+    LDR     R1, [R0, #RCC_AHB2ENR]
+    ORR     R1, R1, #RCC_AHB2ENR_GPIOAEN  ; Enable GPIOA clock
+    ORR     R1, R1, #RCC_AHB2ENR_GPIOBEN  ; Enable GPIOB clock
+    ORR     R1, R1, #RCC_AHB2ENR_GPIOCEN  ; Enable GPIOC clock
+    STR     R1, [R0, #RCC_AHB2ENR]
+    
+    ; Setting GPIOC pin 13 (blue button) as input with pull-up
+    LDR     R0, =GPIOC_BASE
+    LDR     R1, [R0, #GPIO_MODER]
+    BIC     R1, R1, #(3<<(13*2))  ; Clear bits for PC13
+    STR     R1, [R0, #GPIO_MODER]
+    
+    LDR     R1, [R0, #GPIO_PUPDR]
+    BIC     R1, R1, #(3<<(13*2))  ; Clear bits for PC13
+    ORR     R1, R1, #(1<<(13*2))  ; Set as pull-up
+    STR     R1, [R0, #GPIO_PUPDR]
+	
+	
+ 
+    ; Set PA5 as output for the onboard LED
+    LDR     R0, =GPIOA_BASE
+    LDR     R1, [R0, #GPIO_MODER]
+    BIC     R1, R1, #(3<<(5*2))   ; Clear PA5 mode bits
+    ORR     R1, R1, #(1<<(5*2))   ; Set PA5 as output (01)
+    STR     R1, [R0, #GPIO_MODER]
+    
+    ; Set output type as push-pull for LED
+    LDR     R1, [R0, #GPIO_OTYPER]
+    BIC     R1, R1, #(1<<5)       ; PA5 as push-pull
+    STR     R1, [R0, #GPIO_OTYPER]
+    ; First literal pool for GPIO_Init
+    LTORG
+    
+    ; Setting GPIOA pin 0 (reset button) as input with pull-up
+    LDR     R0, =GPIOA_BASE
+    LDR     R1, [R0, #GPIO_MODER]
+    BIC     R1, R1, #(3<<(0*2))   ; Clear bits for PA0
+    STR     R1, [R0, #GPIO_MODER]
+    
+    LDR     R1, [R0, #GPIO_PUPDR]
+    BIC     R1, R1, #(3<<(0*2))   ; Clear bits for PA0
+    ORR     R1, R1, #(1<<(0*2))   ; Set as pull-up
+    STR     R1, [R0, #GPIO_PUPDR]
+    
+    ; Configuring PA8, PA9, PA10
+    LDR     R1, [R0, #GPIO_MODER]
+    BIC     R1, R1, #(3<<(8*2))   ; Clear PA8
+    ORR     R1, R1, #(1<<(8*2))   ; Set PA8 as output for 7-segment
+    
+    BIC     R1, R1, #(3<<(9*2))   ; Clear PA9 (input for keypad column 2)
+    BIC     R1, R1, #(3<<(10*2))  ; Clear PA10 (input for keypad column 3)
+    STR     R1, [R0, #GPIO_MODER]
+    
+    ; Set PA9-PA10 as pull-up
+    LDR     R1, [R0, #GPIO_PUPDR]
+    BIC     R1, R1, #(3<<(9*2))   ; Clear PA9
+    ORR     R1, R1, #(1<<(9*2))   ; Set PA9 as pull-up
+    BIC     R1, R1, #(3<<(10*2))  ; Clear PA10
+    ORR     R1, R1, #(1<<(10*2))  ; Set PA10 as pull-up
+    STR     R1, [R0, #GPIO_PUPDR]
+    
+    ; Set GPIOB pins 2, 3, 6, 7 as outputs for train stepper motor
+    LDR     R0, =GPIOB_BASE
+    LDR     R1, [R0, #GPIO_MODER]
+    
+    ; Clear bits then set as output (01)
+    BIC     R1, R1, #(3<<(2*2))   ; Clear PB2
+    ORR     R1, R1, #(1<<(2*2))   ; Set PB2 as output
+    
+    BIC     R1, R1, #(3<<(3*2))   ; Clear PB3
+    ORR     R1, R1, #(1<<(3*2))   ; Set PB3 as output
+    
+    BIC     R1, R1, #(3<<(6*2))   ; Clear PB6
+    ORR     R1, R1, #(1<<(6*2))   ; Set PB6 as output
+    
+    BIC     R1, R1, #(3<<(7*2))   ; Clear PB7
+    ORR     R1, R1, #(1<<(7*2))   ; Set PB7 as output
+    
+    ; Set PB0, PB1, PB4, PB5
+    BIC     R1, R1, #(3<<(0*2))   ; Clear PB0
+    ORR     R1, R1, #(1<<(0*2))   ; Set PB0 as output for decoder
+    
+    BIC     R1, R1, #(3<<(1*2))   ; Clear PB1 (input for keypad column 1)
+    
+    BIC     R1, R1, #(3<<(4*2))   ; Clear PB4
+    ORR     R1, R1, #(1<<(4*2))   ; Set PB4 as output for decoder
+    
+    BIC     R1, R1, #(3<<(5*2))   ; Clear PB5
+    ORR     R1, R1, #(1<<(5*2))   ; Set PB5 as output for decoder
+    
+    STR     R1, [R0, #GPIO_MODER]
+    
+    ; Set pull-up for PB1 (keypad column 1)
+    LDR     R1, [R0, #GPIO_PUPDR]
+    BIC     R1, R1, #(3<<(1*2))   ; Clear PB1
+    ORR     R1, R1, #(1<<(1*2))   ; Set PB1 as pull-up
+    STR     R1, [R0, #GPIO_PUPDR]
+    
+    ; Second literal pool for GPIO_Init
+    LTORG
+    
+    ; Set output type as push-pull for train motor pins
+    LDR     R0, =GPIOB_BASE
+    LDR     R1, [R0, #GPIO_OTYPER]
+    BIC     R1, R1, #(1<<2)       ; PB2 as push-pull
+    BIC     R1, R1, #(1<<3)       ; PB3 as push-pull
+    BIC     R1, R1, #(1<<6)       ; PB6 as push-pull
+    BIC     R1, R1, #(1<<7)       ; PB7 as push-pull
+    BIC     R1, R1, #(1<<0)       ; PB0 as push-pull
+    BIC     R1, R1, #(1<<4)       ; PB4 as push-pull
+    BIC     R1, R1, #(1<<5)       ; PB5 as push-pull
+    STR     R1, [R0, #GPIO_OTYPER]
+    
+    ; Set output type as push-pull for PA8 (7-segment B input)
+    LDR     R0, =GPIOA_BASE
+    LDR     R1, [R0, #GPIO_OTYPER]
+    BIC     R1, R1, #(1<<8)       ; PA8 as push-pull
+    STR     R1, [R0, #GPIO_OTYPER]
+    
+    ; Set GPIOC pins 0-3 as outputs for keypad rows
+    LDR     R0, =GPIOC_BASE
+    LDR     R1, [R0, #GPIO_MODER]
+    
+    BIC     R1, R1, #0xFF         ; Clear bits 0-7 (pins 0-3)
+    ORR     R1, R1, #0x55         ; Set as output (01 pattern)
+    
+    ; Set GPIOC pins 5,6,8,9 as outputs for door stepper motor
+    BIC     R1, R1, #(3<<(5*2))   ; Clear PC5
+    ORR     R1, R1, #(1<<(5*2))   ; Set PC5 as output
+    
+    BIC     R1, R1, #(3<<(6*2))   ; Clear PC6
+    ORR     R1, R1, #(1<<(6*2))   ; Set PC6 as output
+    
+    BIC     R1, R1, #(3<<(8*2))   ; Clear PC8
+    ORR     R1, R1, #(1<<(8*2))   ; Set PC8 as output
+    
+    BIC     R1, R1, #(3<<(9*2))   ; Clear PC9
+    ORR     R1, R1, #(1<<(9*2))   ; Set PC9 as output
+    
+    STR     R1, [R0, #GPIO_MODER]
+    
+    ; Third literal pool for GPIO_Init
+    LTORG
+    
+    ; Set output type as push-pull for door motor pins
+    LDR     R0, =GPIOC_BASE
+    LDR     R1, [R0, #GPIO_OTYPER]
+    BIC     R1, R1, #(1<<5)       ; PC5 as push-pull
+    BIC     R1, R1, #(1<<6)       ; PC6 as push-pull
+    BIC     R1, R1, #(1<<8)       ; PC8 as push-pull
+    BIC     R1, R1, #(1<<9)       ; PC9 as push-pull
+    STR     R1, [R0, #GPIO_OTYPER]
+    
+    POP     {PC}
+
+    ; Literal pool after GPIO_Init
+    LTORG
+
+; Emergency stop handler
+emergency_stop
+    ; Set mode to emergency
+    LDR     R0, =current_mode
+    MOV     R1, #MODE_EMERGENCY
+    STR     R1, [R0]
+    
+    ; Report emergency
+    BL      report_emergency
+    
+    ; Display emergency code on 7-segment display
+    MOV     R0, #0xE              ; 'E' for emergency
+    BL      update_display
+    
+    ; Turn on emergency LED - PA5 (built-in green LED)
+    LDR     R0, =GPIOA_BASE       ; Changed from GPIOC to GPIOA
+    LDR     R1, [R0, #GPIO_ODR]
+    ORR     R1, R1, #(1<<5)       ; Set PA5 high (changed from PC4 to PA5)
+    STR     R1, [R0, #GPIO_ODR]
+    
+    B       main_loop
+; Report emergency via UART
+report_emergency
+    PUSH    {LR}
+    LDR     R0, =EmergencyMsg
+    LDR     R1, =EmergencyMsgLen
+    BL      USART2_Write
+    
+    ; Add delay here
+    MOV     R0, #10000
+    BL      delay
+    
+    POP     {PC}
+; Reset train handler
+reset_train
+    ; Report reset
+    BL      report_reset
+    
+    ; Set mode to automatic
+    LDR     R0, =current_mode
+    MOV     R1, #MODE_AUTO
+    STR     R1, [R0]
+    
+    ; Reset direction to forward
+    LDR     R0, =train_direction
+    MOV     R1, #DIR_FORWARD
+    STR     R1, [R0]
+    
+    ; If not at station A, return to station A
+    LDR     R0, =current_station
+    LDR     R1, [R0]
+    
+    CMP     R1, #STATION_A
+    BEQ     reset_complete
+    
+    ; Set destination to station A
+    LDR     R0, =destination
+    MOV     R1, #STATION_A
+    STR     R1, [R0]
+    
+    ; Close doors if open
+    LDR     R0, =door_state
+    LDR     R1, [R0]
+    CMP     R1, #1                ; Check if doors are open
+    BNE     move_to_station_A
+    
+    ; Close the doors
+    MOV     R0, #0                ; Direction: 0 for close
+    BL      operate_doors
+    
+    ; Literal pool in reset_train
+    LTORG
+    
+move_to_station_A
+    ; Calculate steps needed
+    LDR     R0, =current_station
+    LDR     R1, [R0]
+    
+    MOV     R2, #STATION_STEPS
+    MUL     R1, R1, R2            ; R1 now has steps from A to current
+    
+    MOV     R5, R1                ; Number of steps
+    MOV     R6, #DIR_BACKWARD     ; Direction: backward to A
+    BL      move_train
+    
+    ; Update current station
+    LDR     R0, =current_station
+    MOV     R1, #STATION_A
+    STR     R1, [R0]
+    
+reset_complete
+    ; Display current station on 7-segment
+    LDR     R0, =current_station
+    LDR     R0, [R0]
+    BL      update_display
+    
+   ; Turn off emergency LED if it was on
+    LDR     R0, =GPIOA_BASE       ; Changed from GPIOC to GPIOA
+    LDR     R1, [R0, #GPIO_ODR]
+    BIC     R1, R1, #(1<<5)       ; Clear PA5 (changed from PC4 to PA5)
+    STR     R1, [R0, #GPIO_ODR]
+    
+    B       main_loop
+
+; Report reset via UART
+report_reset
+    PUSH    {LR}
+    LDR     R0, =ResetMsg
+    LDR     R1, =ResetMsgLen
+    BL      USART2_Write
+    
+    ; Add delay here
+    MOV     R0, #10000
+    BL      delay
+    
+    POP     {PC}
+
+    ; Literal pool after report functions
+    LTORG
+
+; Automatic train operation
+; Automatic train operation
+auto_operation
+    PUSH    {LR}
+    
+    ; Get current station and destination
+    LDR     R0, =current_station
+    LDR     R2, [R0]              ; R2 = current station
+    
+    LDR     R0, =destination
+    LDR     R3, [R0]              ; R3 = destination
+    
+    ; If at destination, determine next destination
+    CMP     R2, R3
+    BNE     start_movement
+    
+    ; Get door state
+    LDR     R0, =door_state
+    LDR     R1, [R0]
+    
+    ; If doors are closed, open them
+    CMP     R1, #0
+    BNE     doors_already_open
+    
+    ; Open the doors
+    MOV     R0, #1                ; Direction: 1 for open
+    BL      operate_doors
+    
+    ; Report doors open
+    BL      report_doors_open
+    
+doors_already_open
+    ; Wait for passenger exit/entry time
+    LDR     R0, =dwell_counter
+    LDR     R1, [R0]
+    
+    ADD     R1, R1, #1            ; Increment counter
+    STR     R1, [R0]
+    
+    ; Add a longer delay here to slow down the counter
+    PUSH    {R0-R3}               ; Save registers
+    
+    ; Use nested loops for a longer delay
+    MOV     R2, #50
+outer_delay_loop
+    MOV     R3, #0xFFFF
+inner_delay_loop
+    SUBS    R3, R3, #1
+    BNE     inner_delay_loop
+    SUBS    R2, R2, #1
+    BNE     outer_delay_loop
+    
+    POP     {R0-R3}               ; Restore registers
+    
+    CMP     R1, #DWELL_TIME       ; Check if dwell time reached
+    BLT     auto_complete
+    
+    ; Reset dwell counter
+    MOV     R1, #0
+    STR     R1, [R0]
+    ; Reset dwell counter
+    MOV     R1, #0
+    STR     R1, [R0]
+    
+    ; Check door state again
+    LDR     R0, =door_state
+    LDR     R1, [R0]
+    
+    ; Only close doors if they're currently open
+    CMP     R1, #1
+    BNE     determine_next_destination    ; Skip door closing if doors already closed
+    
+    ; Close the doors
+    MOV     R0, #0                ; Direction: 0 for close
+    BL      operate_doors
+    
+    ; Report doors closed
+    BL      report_doors_closed
+    
+determine_next_destination
+    ; Reload current station value to ensure it's accurate
+    LDR     R0, =current_station
+    LDR     R2, [R0]              ; R2 = current station
+    
+    ; Force the train to move to a different station after door operations
+    LDR     R0, =train_direction
+    LDR     R1, [R0]              ; R1 = current direction
+    
+    CMP     R1, #DIR_FORWARD
+    BEQ     moving_forward
+    
+    ; Moving backward
+    CMP     R2, #STATION_A
+    BEQ     change_to_forward     ; At A, change to forward
+    
+    SUB     R3, R2, #1            ; Next station is current - 1
+    B       set_next_destination
+    
+moving_forward
+    CMP     R2, #STATION_C
+    BEQ     change_to_backward    ; At C, change to backward
+    
+    ADD     R3, R2, #1            ; Next station is current + 1
+    B       set_next_destination
+    
+change_to_forward
+    MOV     R1, #DIR_FORWARD
+    STR     R1, [R0]              ; Update direction to forward
+    MOV     R3, #STATION_B        ; Next destination is B
+    B       set_next_destination
+    
+change_to_backward
+    MOV     R1, #DIR_BACKWARD
+    STR     R1, [R0]              ; Update direction to backward
+    MOV     R3, #STATION_B        ; Next destination is B
+    
+set_next_destination
+    ; Update destination
+    LDR     R0, =destination
+    
+    ; Make sure destination is different from current station
+    CMP     R2, R3
+    BEQ     force_movement        ; If same, force a different destination
+    
+    STR     R3, [R0]              ; Store new destination
+    
+    ; Report next destination
+    BL      report_next_station
+    B       auto_complete
+    
+force_movement
+    ; If we somehow got the same station, force a different one
+    ADD     R3, R3, #1            ; Move forward one station
+    CMP     R3, #3                ; Check if past station C
+    BLT     store_dest            ; If less than 3, use it
+    MOV     R3, #0                ; Otherwise, wrap to station A
+    
+store_dest
+    STR     R3, [R0]              ; Store forced new destination
+    
+    ; Report next destination
+    BL      report_next_station
+    
+    B       auto_complete
+    
+    
+start_movement
+    ; Calculate direction and steps
+    CMP     R2, R3
+    BLT     move_up               ; Current < Destination, move up
+    
+    ; Move down
+    SUB     R5, R2, R3            ; Steps = current - destination
+    MOV     R6, #DIR_BACKWARD     ; Direction: backward
+    B       do_movement
+    
+move_up
+    SUB     R5, R3, R2            ; Steps = destination - current
+    MOV     R6, #DIR_FORWARD      ; Direction: forward
+    
+do_movement
+    MOV     R7, #STATION_STEPS
+    MUL     R5, R5, R7            ; Convert station count to steps
+    
+    ; Report movement start
+    BL      report_moving
+    
+    ; Move the train
+    BL      move_train
+    
+    ; Update current station
+    LDR     R0, =current_station
+    STR     R3, [R0]              ; Current = destination
+    
+    ; Update display
+    MOV     R0, R3                ; Station number to display
+    BL      update_display
+    
+    ; Report arrival
+    BL      report_arrival
+    
+auto_complete
+    POP     {PC}
+
+    ; Literal pool after auto_operation
+    LTORG
+
+; UART reporting functions
+report_doors_open
+    PUSH    {LR}
+    LDR     R0, =DoorOpenMsg
+    LDR     R1, =DoorOpenMsgLen
+    BL      USART2_Write
+    
+    ; Add delay here
+    MOV     R0, #10000
+    BL      delay
+    
+    ; Add a message about passenger waiting time
+    LDR     R0, =PassengerWaitMsg
+    LDR     R1, =PassengerWaitMsgLen
+    BL      USART2_Write
+    
+    ; Add delay here
+    MOV     R0, #10000
+    BL      delay
+    
+    POP     {PC}
+
+report_doors_closed
+    PUSH    {LR}
+    LDR     R0, =DoorCloseMsg
+    LDR     R1, =DoorCloseMsgLen
+    BL      USART2_Write
+    
+    ; Add delay here
+    MOV     R0, #10000
+    BL      delay
+    
+    POP     {PC}
+
+report_next_station
+    PUSH    {LR}
+    LDR     R0, =NextStationMsg
+    LDR     R1, =NextStationMsgLen
+    BL      USART2_Write
+    
+    ; Add delay here
+    MOV     R0, #10000
+    BL      delay
+    
+    LDR     R0, =destination
+    LDR     R0, [R0]
+    ADD     R1, R0, #'A'          ; Convert 0,1,2 to 'A','B','C'
+    LDR     R0, =station_char
+    STRB    R1, [R0]
+    LDR     R0, =station_char
+    MOV     R1, #1
+    BL      USART2_Write
+    
+    ; Add delay here
+    MOV     R0, #10000
+    BL      delay
+    
+    LDR     R0, =NewLine
+    LDR     R1, =NewLineLen
+    BL      USART2_Write
+    POP     {PC}
+
+    ; Literal pool after reporting functions
+    LTORG
+
+report_moving
+    PUSH    {LR}
+    LDR     R0, =MovingMsg
+    LDR     R1, =MovingMsgLen
+    BL      USART2_Write
+    
+    ; Add delay here
+    MOV     R0, #10000
+    BL      delay
+    
+    POP     {PC}
+
+report_arrival
+    PUSH    {LR}
+    LDR     R0, =ArrivalMsg
+    LDR     R1, =ArrivalMsgLen
+    BL      USART2_Write
+    
+    ; Add delay here
+    MOV     R0, #10000
+    BL      delay
+    
+    LDR     R0, =current_station
+    LDR     R0, [R0]
+    ADD     R1, R0, #'A'          ; Convert 0,1,2 to 'A','B','C'
+    LDR     R0, =station_char
+    STRB    R1, [R0]
+    LDR     R0, =station_char
+    MOV     R1, #1
+    BL      USART2_Write
+    
+    ; Add delay here
+    MOV     R0, #10000
+    BL      delay
+    
+    LDR     R0, =NewLine
+    LDR     R1, =NewLineLen
+    BL      USART2_Write
+    POP     {PC}
+    ; Literal pool after reporting functions
+    LTORG
+
+; Manual operation mode
+manual_operation
+    PUSH    {LR}
+    
+    ; Check if we are at the desired destination
+    LDR     R0, =current_station
+    LDR     R1, [R0]              ; R1 = current station
+    
+    LDR     R0, =manual_destination
+    LDR     R2, [R0]              ; R2 = manual destination
+    
+    CMP     R1, R2
+    BEQ     manual_at_destination
+    
+    ; Not at destination, need to move
+    ; Make sure doors are closed first
+    LDR     R0, =door_state
+    LDR     R3, [R0]
+    CMP     R3, #0
+    BEQ     manual_doors_closed
+    
+    ; Close doors if they're open
+    MOV     R0, #0                ; Direction: 0 for close
+    BL      operate_doors
+    
+    ; Update door state
+    LDR     R0, =door_state
+    MOV     R3, #0
+    STR     R3, [R0]
+    
+manual_doors_closed
+    ; Calculate direction and steps
+    CMP     R1, R2
+    BLT     manual_move_up        ; Current < Destination, move up
+    
+    ; Move down
+    SUB     R5, R1, R2            ; Steps = current - destination
+    MOV     R6, #DIR_BACKWARD     ; Direction: backward
+    B       manual_do_movement
+    
+manual_move_up
+    SUB     R5, R2, R1            ; Steps = destination - current
+    MOV     R6, #DIR_FORWARD      ; Direction: forward
+    
+manual_do_movement
+    MOV     R7, #STATION_STEPS
+    MUL     R5, R5, R7            ; Convert station count to steps
+    
+    ; Report manual movement
+    BL      report_manual_movement
+    
+    ; Move the train
+    BL      move_train
+    
+    ; Update current station
+    LDR     R0, =current_station
+    STR     R2, [R0]              ; Current = manual destination
+    
+    ; Update display
+    MOV     R0, R2                ; Station number to display
+    BL      update_display
+    
+    ; Report arrival
+    BL      report_arrival
+    
+manual_at_destination
+    ; Open doors at destination
+    LDR     R0, =door_state
+    LDR     R3, [R0]
+    CMP     R3, #1
+    BEQ     manual_doors_already_open
+    
+    ; Open the doors
+    MOV     R0, #1                ; Direction: 1 for open
+    BL      operate_doors
+    
+    ; Update door state
+    LDR     R0, =door_state
+    MOV     R3, #1
+    STR     R3, [R0]
+    
+    ; Report doors open
+    BL      report_doors_open
+    
+manual_doors_already_open
+    ; Reset mode to automatic
+    LDR     R0, =current_mode
+    MOV     R1, #MODE_AUTO
+    STR     R1, [R0]
+    
+    ; Update destination for auto mode to be current station
+    LDR     R0, =destination
+    LDR     R1, =current_station
+    LDR     R1, [R1]
+    STR     R1, [R0]
+    
+    POP     {PC}
+
+    ; Literal pool after manual_operation
+    LTORG
+
+report_manual_movement
+    PUSH    {LR}
+    LDR     R0, =ManualMsg
+    LDR     R1, =ManualMsgLen
+    BL      USART2_Write
+    
+    LDR     R0, =manual_destination
+    LDR     R0, [R0]
+    ADD     R1, R0, #'A'          ; Convert 0,1,2 to 'A','B','C'
+    LDR     R0, =station_char
+    STRB    R1, [R0]
+    LDR     R0, =station_char
+    MOV     R1, #1
+    BL      USART2_Write
+    
+    LDR     R0, =NewLine
+    LDR     R1, =NewLineLen
+    BL      USART2_Write
+    POP     {PC}
+
+; Update the 7-segment display
+; R0 = Value to display (0-2 for stations, 0xE for emergency)
+update_display
+    PUSH    {R0-R4, LR}
+    
+    ; Check for emergency code (0xE)
+    CMP     R0, #0xE
+    BEQ     display_emergency
+    
+    ; For stations, just use the number directly (0,1,2)
+    ; No need to add 0xA anymore
+    B       display_update
+    
+display_emergency
+    MOV     R0, #0x9             ; *display a 9 instead of E
+    
+display_update
+    ; Map to BCD-to-7-segment decoder inputs 
+    ; PB0 = A input (LSB)
+    ; PA8 = B input
+    ; PB4 = C input
+    ; PB5 = D input (MSB)
+    
+    ; Set PB0, PB4, PB5
+    LDR     R1, =GPIOB_BASE
+    LDR     R2, [R1, #GPIO_ODR]
+    
+    ; Clear the display bits in GPIOB
+    BIC     R2, R2, #0x31         ; Clear PB0, PB4, PB5
+    
+    ; Map BCD bits 0, 2, 3 to PB0, PB4, PB5
+    AND     R3, R0, #1            ; Get bit 0
+    ORR     R2, R2, R3            ; Set PB0 (A input)
+    
+    AND     R3, R0, #4            ; Get bit 2
+    LSR     R3, #2                ; Shift to bit 0
+    LSL     R3, #4                ; Shift to PB4 position
+    ORR     R2, R2, R3            ; Set PB4 (C input)
+    
+    AND     R3, R0, #8            ; Get bit 3
+    LSR     R3, #3                ; Shift to bit 0
+    LSL     R3, #5                ; Shift to PB5 position
+    ORR     R2, R2, R3            ; Set PB5 (D input)
+    
+    ; Update GPIOB output
+    STR     R2, [R1, #GPIO_ODR]
+    
+    ; Set PA8 (B input) - bit 1 of BCD
+    LDR     R1, =GPIOA_BASE
+    LDR     R2, [R1, #GPIO_ODR]
+    
+    ; Clear PA8
+    BIC     R2, R2, #(1<<8)
+    
+    ; Map bit 1 to PA8
+    AND     R3, R0, #2            ; Get bit 1
+    LSR     R3, #1                ; Shift to bit 0
+    LSL     R3, #8                ; Shift to PA8 position
+    ORR     R2, R2, R3            ; Set PA8 (B input)
+    
+    ; Update GPIOA output
+    STR     R2, [R1, #GPIO_ODR]
+    
+    POP     {R0-R4, PC}
+
+    ; Literal pool after update_display
+    LTORG
+
+; Operate the doors (open/close)
+; R0 = Direction (1 = open, 0 = close)
+; Operate the doors (open/close)
+; R0 = Direction (1 = open, 0 = close)
+operate_doors
+    PUSH    {R1-R8, LR}
+    
+    MOV     R6, R0                ; Save direction (1 for open/CCW, 0 for close/CW)
+    MOV     R5, #DOOR_OPEN_STEPS  ; Number of steps for door operation
+    
+    ; Update door state
+    LDR     R0, =door_state
+    STR     R6, [R0]              ; Store new door state
+    
+    ; Initialize step counter
+    MOV     R7, #0
+    
+door_rotate_loop
+    CMP     R7, R5                ; Check if reached requested steps
+    BEQ     door_rotate_done      ; Exit when complete - ENSURES FINITE LOOP
+    
+    ; Get the step pattern
+    LDR     R0, =door_step_index
+    LDR     R8, [R0]              ; Load current step index
+    
+    CMP     R6, #1
+    BEQ     door_rotate_open
+    
+    ; Close (CW): Decrement index
+    SUB     R8, R8, #1
+    CMP     R8, #0
+    BGE     door_update_step
+    MOV     R8, #3                ; Wrap around to 3
+    B       door_update_step
+    
+door_rotate_open
+    ; Open (CCW): Increment index
+    ADD     R8, R8, #1
+    CMP     R8, #4
+    BLT     door_update_step
+    MOV     R8, #0                ; Wrap around to 0
+    
+door_update_step
+    STR     R8, [R0]              ; Store updated step index
+    
+    ; Set the motor outputs based on step pattern
+    LDR     R0, =GPIOC_BASE
+    LDR     R1, =door_step_patterns    ; Load address of step patterns array
+    LDR     R2, [R1, R8, LSL #2]  ; Load pattern from array (R8*4 offset for word size)
+    
+    ; Output the pattern to GPIO pins
+    LDR     R3, [R0, #GPIO_ODR]   ; Reading current GPIO output
+    BIC     R3, R3, #(1<<5 :OR: 1<<6 :OR: 1<<8 :OR: 1<<9)  ; Clearing door motor pins
+    ORR     R3, R3, R2            ; Combine with new pattern
+    STR     R3, [R0, #GPIO_ODR]   ; Update GPIO output
+    
+    ; Delay for motor step
+    MOV     R0, #0x10000          ; Fixed this line - use MOV instead of LDR
+    BL      delay                 ; Call delay function
+    
+    ADD     R7, R7, #1            ; Increment step counter
+    B       door_rotate_loop      ; Continue loop until R7 = R5
+    
+door_rotate_done
+    POP     {R1-R8, PC}           ; Restore registers and return
+	LTORG
+
+; Move the train
+; R5 = Number of steps
+; R6 = Direction (DIR_FORWARD or DIR_BACKWARD)
+
+move_train
+    PUSH    {R1-R8, LR}
+    
+    ; Initialize step counter
+    MOV     R7, #0
+    
+    ; Gradual acceleration and deceleration
+    MOV     R8, #200              ; Initial delay (slow)
+    
+move_loop
+    CMP     R7, R5                ; Check if reached requested steps
+    BEQ     move_done
+    
+    ; Get the step pattern
+    LDR     R0, =train_step_index
+    LDR     R4, [R0]              ; Load current step index
+    
+    ; Adjust direction based on train direction
+    CMP     R6, #DIR_FORWARD
+    BEQ     rotate_forward
+    
+    ; Backward: Decrement index
+    SUB     R4, R4, #1
+    CMP     R4, #0
+    BGE     update_train_step
+    MOV     R4, #3                ; Wrap around to 3
+    B       update_train_step
+    
+rotate_forward
+    ; Forward: Increment index
+    ADD     R4, R4, #1
+    CMP     R4, #4
+    BLT     update_train_step
+    MOV     R4, #0                ; Wrap around to 0
+    
+update_train_step
+    STR     R4, [R0]              ; Store updated step index
+    
+    ; Set the motor outputs based on step pattern (direct coil control)
+    LDR     R0, =GPIOB_BASE
+    
+    ; Clear existing motor outputs (PB2, PB3, PB6, PB7)
+    LDR     R3, [R0, #GPIO_ODR]
+    BIC     R3, R3, #0xCC         ; Clear bits 2,3,6,7 (0xCC = 11001100)
+    
+    ; Set the appropriate pin based on step index
+    CMP     R4, #0
+    BNE     check_step1
+    ORR     R3, R3, #(1<<2)       ; Set PB2 for step 0
+    B       output_pattern
+    
+check_step1
+    CMP     R4, #1
+    BNE     check_step2
+    ORR     R3, R3, #(1<<3)       ; Set PB3 for step 1
+    B       output_pattern
+    
+check_step2
+    CMP     R4, #2
+    BNE     step3
+    ORR     R3, R3, #(1<<6)       ; Set PB6 for step 2
+    B       output_pattern
+    
+step3
+    ORR     R3, R3, #(1<<7)       ; Set PB7 for step 3
+    
+output_pattern
+    ; Output the pattern to GPIO
+    STR     R3, [R0, #GPIO_ODR]
+    
+    ; Delay for motor step - make this longer for testing
+    MOV     R0, #0x80000          ; Increased delay for testing
+    BL      delay
+    
+    ADD     R7, R7, #1            ; Increment step counter
+    B       move_loop
+    
+move_done
+    ; Send movement complete message
+    BL      report_stopped
+    
+    POP     {R1-R8, PC}
+    ; Literal pool after move_train
+    LTORG
+
+report_stopped
+    PUSH    {LR}
+    LDR     R0, =StoppedMsg
+    LDR     R1, =StoppedMsgLen
+    BL      USART2_Write
+    
+    ; Add delay here
+    MOV     R0, #10000
+    BL      delay
+    
+    POP     {PC}
+
+; Scan keypad for input
+; Scan keypad for input
+scan_keypad
+    PUSH    {R0-R9, LR}
+    
+    ; Define base addresses for GPIO registers
+    LDR     R7, =GPIOC_BASE       ; Store GPIOC base in R7 (rows)
+    LDR     R8, =GPIOB_BASE       ; Store GPIOB base in R8 (column 1)
+    LDR     R9, =GPIOA_BASE       ; Store GPIOA base in R9 (columns 2-3)
+    
+    ; Set up row pattern - will shift through rows
+    MOV     R4, #0xE              ; Start with pattern 1110 (Row 1 active)
+    MOV     R5, #0                ; Current row counter (0-3)
+    
+keypad_row_loop
+    ; Check if we've scanned all rows
+    CMP     R5, #4
+    BEQ     keypad_exit           ; Exit if all rows scanned
+    
+    ; Activate current row pattern
+    STR     R4, [R7, #GPIO_ODR]   ; Write to GPIO output data register
+    
+    ; Short delay for settling
+    MOV     R0, #0xFF
+    BL      keypad_short_delay
+    
+    ; Read column states
+    LDR     R0, [R8, #GPIO_IDR]   ; Read GPIOB for column 1
+    AND     R0, R0, #0x2          ; Mask for column 1 (PB1)
+    
+    LDR     R1, [R9, #GPIO_IDR]   ; Read GPIOA for columns 2-3
+    AND     R1, R1, #0x600        ; Mask for columns 2-3 (PA9, PA10)
+    
+    ; Check if any key is pressed in this row
+    CMP     R0, #0x2              ; Check column 1
+    BNE     key_pressed           ; Key pressed in column 1
+    
+    AND     R2, R1, #0x200        ; Check column 2 (PA9)
+    CMP     R2, #0x200
+    BNE     key_pressed_col2      ; Key pressed in column 2
+    
+    AND     R2, R1, #0x400        ; Check column 3 (PA10)
+    CMP     R2, #0x400
+    BNE     key_pressed_col3      ; Key pressed in column 3
+    
+    ; No key pressed in this row, move to next row
+    ROR     R4, R4, #1            ; Rotate row pattern (shift active low bit)
+    ADD     R5, R5, #1            ; Increment row counter
+    B       keypad_row_loop       ; Continue with next row
+    
+; Process key press in column 1
+key_pressed
+    MOV     R2, #0                ; Column 0
+    B       process_key
+    
+; Process key press in column 2
+key_pressed_col2
+    MOV     R2, #1                ; Column 1
+    B       process_key
+    
+; Process key press in column 3
+key_pressed_col3
+    MOV     R2, #2                ; Column 2
+    
+; Process which key was pressed based on row and column
+process_key
+    ; Calculate key value from row and column
+    ; Key = row*3 + column
+    MOV     R3, R5                ; Copy row number
+    LSL     R3, R3, #1            ; Multiply by 2
+    ADD     R3, R3, R5            ; Add row (total = row*3)
+    ADD     R3, R3, R2            ; Add column to get key value
+    
+    ; Handle key based on value (0-11)
+    CMP     R3, #0                ; Key 1 (row 0, col 0)
+    BEQ     keypad_row1_col1
+    CMP     R3, #1                ; Key 2 (row 0, col 1)
+    BEQ     keypad_row1_col2
+    CMP     R3, #2                ; Key 3 (row 0, col 2)
+    BEQ     keypad_row1_col3
+    CMP     R3, #3                ; Key 4 (row 1, col 0)
+    BEQ     keypad_row2_col1
+    CMP     R3, #4                ; Key 5 (row 1, col 1)
+    BEQ     keypad_row2_col2
+    
+    ; Other keys not used, just exit
+    B       keypad_exit
+    
+; Key handlers for each position
+keypad_row1_col1                  ; Key 1 = Go to Station A
+    MOV     R1, #STATION_A
+    B       keypad_set_destination
+    
+keypad_row1_col2                  ; Key 2 = Go to Station B
+    MOV     R1, #STATION_B
+    B       keypad_set_destination
+    
+keypad_row1_col3                  ; Key 3 = Go to Station C
+    MOV     R1, #STATION_C
+    B       keypad_set_destination
+    
+keypad_row2_col1                  ; Key 4 = Emergency stop
+    B       emergency_stop_jump   ; Use jump for long branch
+    
+keypad_row2_col2                  ; Key 5 = Reset train
+    B       reset_train_jump      ; Use jump for long branch
+    
+keypad_set_destination
+    ; Set manual mode
+    LDR     R0, =current_mode
+    MOV     R2, #MODE_MANUAL
+    STR     R2, [R0]
+    
+    ; Set manual destination
+    LDR     R0, =manual_destination
+    STR     R1, [R0]
+    
+    ; Report manual override
+    BL      report_override
+    
+    ; Wait for key release
+    BL      wait_key_release
+    
+keypad_exit
+    POP     {R0-R9, PC}
+
+; Short delay for keypad debouncing
+keypad_short_delay
+    PUSH    {R0, LR}
+keypad_delay_loop
+    SUBS    R0, R0, #1
+    BNE     keypad_delay_loop
+    POP     {R0, PC}
+
+; Wait for key release
+wait_key_release
+    PUSH    {R0-R3, LR}
+    
+key_release_loop
+    ; Pull down all rows
+    MOV     R3, #0x0              ; Set all rows low
+    STR     R3, [R7, #GPIO_ODR]   ; Write to GPIO output data register
+    
+    ; Short delay
+    MOV     R0, #0xFF             ; Set delay counter
+    BL      keypad_short_delay    ; Call delay function
+    
+    ; Read columns to check if key still pressed
+    LDR     R0, [R8, #GPIO_IDR]   ; Read GPIOB for column 1
+    AND     R0, R0, #0x2          ; Mask for column 1
+    
+    LDR     R1, [R9, #GPIO_IDR]   ; Read GPIOA for columns 2-3
+    AND     R1, R1, #0x600        ; Mask for columns 2-3
+    
+    ; Check if key is still pressed
+    CMP     R0, #0x2              ; Check if column 1 is high (no key pressed)
+    BNE     key_release_loop      ; If still pressed, keep waiting
+    
+    CMP     R1, #0x600            ; Check if columns 2-3 are high (no key pressed)
+    BNE     key_release_loop      ; If still pressed, keep waiting
+    
+    ; Add final debounce delay after release
+    MOV     R0, #100              ; Set longer delay for final debounce
+    BL      keypad_short_delay
+    
+    POP     {R0-R3, PC}
+
+report_override
+    PUSH    {LR}
+    LDR     R0, =OverrideMsg
+    LDR     R1, =OverrideMsgLen
+    BL      USART2_Write
+    
+    ; Add delay here
+    MOV     R0, #10000
+    BL      delay
+    
+    LDR     R0, =manual_destination
+    LDR     R0, [R0]
+    ADD     R1, R0, #'A'          ; Convert 0,1,2 to 'A','B','C'
+    LDR     R0, =station_char
+    STRB    R1, [R0]
+    LDR     R0, =station_char
+    MOV     R1, #1
+    BL      USART2_Write
+    
+    ; Add delay here
+    MOV     R0, #10000
+    BL      delay
+    
+    LDR     R0, =NewLine
+    LDR     R1, =NewLineLen
+    BL      USART2_Write
+    POP     {PC}
+
+    ; Literal pool after report_override
+    LTORG
+
+; Keypad debounce delay
+keypad_debounce_delay
+    PUSH    {R0, LR}
+    LDR     R0, =100             ; Reasonable delay for debounce
+keypad_debounce_loop
+    SUBS    R0, R0, #1
+    BNE     keypad_debounce_loop
+    POP     {R0, PC}
+
+; Simple delay function
+; R0 = Delay count
+delay
+    PUSH    {R0, LR}
+delay_loop
+    SUBS    R0, R0, #1
+    BNE     delay_loop
+    POP     {R0, PC}
+
+    ENDP
+
+    ALIGN
+
+    AREA myData, DATA, READWRITE
+    ALIGN
+
+; Step patterns for train stepper motor (A-B-C-D)
+train_step_patterns  DCD 0x0004, 0x0008, 0x0040, 0x0080  ; PB2, PB3, PB6, PB7 patterns
+
+; Step patterns for door stepper motor (A-B-C-D) - Updated for PC5, PC6, PC8, PC9
+door_step_patterns   DCD 0x0020, 0x0040, 0x0100, 0x0200  ; PC5, PC6, PC8, PC9 patterns
+
+; Current step index for train (0-3)
+train_step_index     DCD 0
+
+; Current step index for door (0-3)
+door_step_index      DCD 0
+
+; System state variables
+current_station      DCD 0      ; Current station (0=A, 1=B, 2=C)
+destination          DCD 0      ; Next automatic destination
+manual_destination   DCD 0      ; Manual override destination
+current_mode         DCD 0      ; Current mode: 0=Auto, 1=Manual, 2=Emergency
+train_direction      DCD 0      ; 0=Forward (A->C), 1=Backward (C->A)
+door_state           DCD 0      ; 0=Closed, 1=Open
+dwell_counter        DCD 0      ; Counter for dwell time at station
+
+; UART output strings with length constants
+StartMsg     DCB "Train Simulation System Starting...", 0x0D, 0x0A, 0
+StartMsgLen  EQU 34
+
+EmergencyMsg DCB "EMERGENCY STOP ACTIVATED!", 0x0D, 0x0A, 0
+EmergencyMsgLen EQU 26
+
+ResetMsg     DCB "System Reset - Returning to Terminal A", 0x0D, 0x0A, 0
+ResetMsgLen  EQU 39
+
+MovingMsg    DCB "Train Moving...", 0x0D, 0x0A, 0
+MovingMsgLen EQU 16
+
+StoppedMsg   DCB "Train Stopped", 0x0D, 0x0A, 0
+StoppedMsgLen EQU 14
+
+ArrivalMsg   DCB "Arrived at Terminal ", 0
+ArrivalMsgLen EQU 19
+
+NextStationMsg DCB "Next station: ", 0
+NextStationMsgLen EQU 14
+
+OverrideMsg  DCB "Manual Override - Destination: ", 0
+OverrideMsgLen EQU 30
+
+DoorOpenMsg  DCB "Doors Opening", 0x0D, 0x0A, 0
+DoorOpenMsgLen EQU 15
+
+DoorCloseMsg DCB "Doors Closing", 0x0D, 0x0A, 0
+DoorCloseMsgLen EQU 15
+
+ManualMsg    DCB "Manual Movement to Terminal ", 0
+ManualMsgLen EQU 27
+
+NewLine      DCB 0x0D, 0x0A, 0
+NewLineLen   EQU 2
+PassengerWaitMsg DCB "Waiting for passengers to enter/exit...", 0x0D, 0x0A, 0
+PassengerWaitMsgLen EQU 39
+station_char DCB "A", 0
+
+    END
